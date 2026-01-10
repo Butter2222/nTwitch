@@ -1,59 +1,53 @@
 # Twitch Terminal Viewer
 
-A terminal-based Twitch viewer that streams video via VLC and displays chat in a terminal interface.
+A terminal-based Twitch viewer that streams video via VLC and displays chat in a split-pane interface.
 
 ## Features
 
-- Multi-channel video streaming (up to 5 channels simultaneously)
+- Multi-channel video streaming (up to 4 channels simultaneously)
 - Split-pane terminal UI showing all channel chats
 - Channel recording with built-in timer
-- Press Tab to switch active channel
-- Anonymous mode for read-only chat
+- Press F1 to switch active channel
+- Chat restriction detection (bans, timeouts, follower-only mode, etc.)
 - Color-coded users (Streamers, Mods, Subs, VIPs)
 - Ad-free streaming via Streamlink
+- Anonymous mode for read-only chat
 
 ## Requirements
 
 - Python 3.8+
-- VLC Media Player ([Download](https://www.videolan.org/vlc/))
+- VLC Media Player
 - Streamlink (installed via pip)
 
-## Quick Start
-
-### 1. Install Dependencies
+## Installation
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-### 2. Run Setup
-
-```bash
+# Run setup wizard
 python twitch_viewer.py --setup
 ```
 
 The setup wizard will configure VLC path, check Streamlink, and optionally set up Twitch authentication.
 
-### 3. Launch Viewer
+## Quick Start
 
 ```bash
 python twitch_viewer.py
 ```
 
-Enter channel name(s) when prompted:
-```
-> xqc, hasanabi, pokimane
-```
+Enter channel names when prompted (comma-separated for multiple channels).
 
 ## Keyboard Controls
 
-- **Tab** - Select/cycle through channels
-- **F2** - Toggle recording for selected channel
-- **F3** - Save 10-minute clip of selected channel
-- **F4** - Switch to different streamers
-- **Enter** - Send message to selected channel
-- **Ctrl+L** - Clear selected channel's chat
-- **Ctrl+C** - Exit application
+- F1 - Switch/cycle active channel
+- F2 - Toggle recording for active channel
+- F3 - Save 10-minute clip of active channel
+- F4 - Switch to different streamers
+- Enter - Send message to active channel
+- Ctrl+L - Clear active channel's chat
+- Ctrl+C - Exit application
 
 ## Command-Line Options
 
@@ -67,7 +61,7 @@ python twitch_viewer.py --channels xqc --quality 720p60
 # Video only (no chat)
 python twitch_viewer.py --channels xqc --no-chat
 
-# Anonymous mode
+# Anonymous mode (read-only)
 python twitch_viewer.py --channels xqc --anon
 
 # Re-run setup
@@ -76,7 +70,7 @@ python twitch_viewer.py --setup
 
 ## Stream Quality Options
 
-- `best` - Highest available (default, ~6-8 Mbps per stream)
+- `best` - Highest available (default, 6-8 Mbps per stream)
 - `1080p60` - 1080p 60fps
 - `720p60` - 720p 60fps (recommended for 3+ streams)
 - `720p` - 720p 30fps
@@ -85,27 +79,33 @@ python twitch_viewer.py --setup
 
 ## Recording Streams
 
-1. Press **Tab** to select the channel you want to record
-2. Press **R** to start recording
-3. Press **R** again to stop recording
+1. Press F1 to select the channel you want to record
+2. Press F2 to start recording
+3. Press F2 again to stop recording
 4. Recordings saved to: `~/Videos/TwitchRecordings/CHANNEL/`
 
-Recording status shown in:
-- Channel header: `[REC 00:05]`
-- Bottom status: `Recording CHANNEL 1:32`
+Recording status is shown in the channel header: `[REC 00:05]`
+
+## Clipping
+
+1. Press F1 to select the channel
+2. Press F3 to save a 10-minute clip
+3. Clips saved to: `~/Videos/TwitchClips/`
+
+The app maintains a 10-minute rolling buffer for each active channel.
 
 ## Terminal UI Layout
 
 ```
-┌───────────────┬───────────────┬───────────────┐
-│ ★ >>> XQC <<< │  >>> HASAN <<<│  >>> POKI <<< │  ← Yellow star = selected
-├───────────────┼───────────────┼───────────────┤
-│ [XQC] msg...  │ [HAS] msg...  │ [POKI] msg... │  ← Orange tag = selected
-│               │               │               │
-└───────────────┴───────────────┴───────────────┘
-★ SELECTED: #XQC (Press [Tab] to switch, [R] to record THIS channel)  |  Recording XQC 1:32
-> 
-[Tab] Select Channel  [R] Record  [S] Switch Streamers  [Ctrl+L] Clear  [Enter] Send  [Ctrl+C] Exit
+┌─────────────────┬─────────────────┬─────────────────┐
+│ >>> XQC <<<     │  >>> HASAN <<<  │  >>> POKI <<<   │
+├─────────────────┼─────────────────┼─────────────────┤
+│ [XQC] msg...    │ [HAS] msg...    │ [POKI] msg...   │
+│                 │                 │                 │
+└─────────────────┴─────────────────┴─────────────────┘
+Selected: #XQC | Recording XQC 1:32
+> Type message for #xqc...
+[F1] Next Channel [F2] Record [F3] Clip [F4] Switch [Ctrl+L] Clear [Ctrl+C] Exit
 ```
 
 Minimum terminal size: 120 columns x 20 rows
@@ -125,13 +125,29 @@ Configuration stored at: `~/.twitch-terminal-config.json`
 }
 ```
 
-### Getting OAuth Token
+## Getting OAuth Token
 
 1. Visit: https://twitchtokengenerator.com/
 2. Select "Bot Chat Token" or "Custom Scopes"
 3. Authorize the application
-4. Copy the "Access Token" (just the token, setup will add `oauth:` prefix automatically)
-5. Paste during setup
+4. Copy the "Access Token"
+5. Paste during setup (setup will add `oauth:` prefix automatically)
+
+## Chat Restrictions
+
+The app automatically detects and displays chat restrictions:
+
+- Permanent bans
+- Account suspensions
+- Timeouts
+- Followers-only mode
+- Subscribers-only mode
+- Slow mode
+- Emote-only mode
+- Rate limiting
+- Duplicate message blocking
+
+Restriction messages appear in red in the chat window.
 
 ## Troubleshooting
 
@@ -152,10 +168,7 @@ python twitch_viewer.py --setup
 - Test manually: `streamlink twitch.tv/CHANNEL best`
 
 ### Terminal Too Small
-Resize to at least 120x20 or use simple UI:
-```bash
-python twitch_viewer.py --channels xqc --simple-ui
-```
+Resize to at least 120x20 or reduce number of channels.
 
 ### Multiple Streams Stopping
 Reduce quality to lower bandwidth usage:
@@ -164,11 +177,11 @@ python twitch_viewer.py --channels xqc,hasan,poki --quality 720p60
 ```
 
 Bandwidth requirements:
-- 1 stream at best: ~6-8 Mbps
-- 3 streams at best: ~18-24 Mbps
-- 3 streams at 720p60: ~12-15 Mbps (more stable)
+- 1 stream at best: 6-8 Mbps
+- 3 streams at best: 18-24 Mbps
+- 3 streams at 720p60: 12-15 Mbps
 
-## Building Standalone Executable
+## Building Executable
 
 ### Windows
 
@@ -178,24 +191,17 @@ build.bat
 
 Creates `dist/TwitchViewer.exe` (15-20 MB)
 
-### Manual Build
-
-```bash
-pip install pyinstaller
-pyinstaller --name=TwitchViewer --onefile --console twitch_viewer.py
-```
-
 Note: VLC and Streamlink must still be installed on target system.
 
 ## Platform Support
 
-- **Windows**: Fully supported (Windows Terminal or PowerShell recommended)
-- **macOS**: Fully supported (iTerm2 or Terminal.app)
-- **Linux**: Fully supported (any modern terminal)
+- Windows: Fully supported (Windows Terminal or PowerShell recommended)
+- macOS: Fully supported (iTerm2 or Terminal.app)
+- Linux: Fully supported (any modern terminal)
 
 ## Performance
 
-- Memory: ~50-100 MB per channel
+- Memory: 50-100 MB per channel
 - CPU: Minimal (VLC handles decoding)
 - Network: Varies by quality
 - Recommended max: 3-5 channels
@@ -203,35 +209,9 @@ Note: VLC and Streamlink must still be installed on target system.
 ## Known Limitations
 
 - Max 4 visible channel panes
-- Text-only chat (Twitch emotes won't display)
+- Text-only chat (Twitch emotes won't display as images)
 - Live streams only (no VODs)
 - Twitch rate limiting: 20 messages per 30 seconds
-
-## Advanced Usage
-
-### Shell Alias (Linux/macOS)
-
-```bash
-echo "alias twitch='python /path/to/twitch_viewer.py --channels'" >> ~/.bashrc
-```
-
-Usage:
-```bash
-twitch xqc,hasanabi
-```
-
-### Batch File (Windows)
-
-Create `twitch.bat`:
-```batch
-@echo off
-python C:\path\to\twitch_viewer.py --channels %*
-```
-
-Usage:
-```batch
-twitch xqc,hasanabi
-```
 
 ## Logs
 
@@ -245,7 +225,7 @@ tail -f twitch_viewer.log
 ## Credits
 
 - Streamlink: https://streamlink.github.io/
-- Blessed: https://github.com/jquast/blessed
+- Textual: https://textual.textualize.io/
 - VLC Media Player: https://www.videolan.org/
 
 ## License

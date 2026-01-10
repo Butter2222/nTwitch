@@ -38,6 +38,11 @@ class ChannelPane(Static):
         overflow: hidden;
     }
     
+    ChannelPane.active {
+        border: solid #f9baff !important;
+        background: #1e1e1e;
+    }
+    
     ChannelPane.recording {
         border: solid #ff0000 !important;
         background: #1e1e1e;
@@ -45,11 +50,13 @@ class ChannelPane(Static):
     
     ChannelPane > RichLog {
         height: 1fr;
+        width: 100%;
         background: #1e1e1e;
         color: #ffffff;
         padding: 0 1;
         overflow-y: auto;
         overflow-x: hidden;
+        scrollbar-size: 0 0;
     }
     
     ChannelPane .channel-header {
@@ -83,7 +90,7 @@ class ChannelPane(Static):
             header_text += f" [REC {self.recording_duration}]"
         
         yield Static(header_text, classes="channel-header")
-        yield RichLog(max_lines=self.max_messages, wrap=True, markup=True, auto_scroll=True)
+        yield RichLog(max_lines=self.max_messages, wrap=True, markup=True)
     
     def add_message(self, message: ChatMessage, my_username: Optional[str] = None):
         """Add a message to the pane."""
@@ -96,43 +103,24 @@ class ChannelPane(Static):
         formatted = self._format_message(message, my_username)
         log.write(formatted)
     
-    def _format_message(self, message: ChatMessage, my_username: Optional[str] = None) -> Text:
-        """Format a chat message with Rich Text styling."""
-        text = Text()
+    def _format_message(self, message: ChatMessage, my_username: Optional[str] = None) -> str:
+        """Format a chat message with Rich Text styling - returns plain string for proper wrapping."""
+        # Build message parts
+        parts = []
         
         # Add badge if present
         badge = message.get_badge_text()
         if badge:
-            if message.is_broadcaster():
-                text.append(f"{badge} ", style="bold red")
-            elif message.is_moderator():
-                text.append(f"{badge} ", style="bold green")
-            else:
-                text.append(f"{badge} ", style="bold")
+            parts.append(badge)
         
-        # Add username with color
-        username_style = self._get_username_style(message)
-        text.append(f"{message.author}", style=username_style)
-        text.append(": ", style="white")
+        # Add username and colon
+        parts.append(f"{message.author}:")
         
-        # Add message content with mention highlighting
-        content = message.content
-        if my_username and f"@{my_username}" in content.lower():
-            # Highlight mentions
-            import re
-            parts = re.split(f'(@{re.escape(my_username)})', content, flags=re.IGNORECASE)
-            for part in parts:
-                if part.lower() == f"@{my_username}".lower():
-                    text.append(part, style="bold yellow on dark_blue")
-                else:
-                    text.append(part, style="white")
-        else:
-            text.append(content, style="white")
+        # Add message content
+        parts.append(message.content)
         
-        # Force wrapping by setting overflow
-        text.overflow = "fold"
-        
-        return text
+        # Join and return as plain string - RichLog will handle wrapping
+        return " ".join(parts)
     
     def _get_username_style(self, message: ChatMessage) -> Style:
         """Get Rich style for username based on user type."""

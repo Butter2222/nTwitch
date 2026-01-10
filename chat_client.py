@@ -305,7 +305,7 @@ class TwitchIRCClient:
                 system_msg = ChatMessage(
                     channel=channel,
                     author="SYSTEM",
-                    content=f"👥 CHAT RESTRICTED: {notice_text}",
+                    content=f"CHAT RESTRICTED: {notice_text}",
                     color="#FFA500",
                     badges=[]
                 )

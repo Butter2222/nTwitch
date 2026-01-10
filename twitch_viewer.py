@@ -70,14 +70,17 @@ class TwitchViewer:
         results = self.stream_manager.launch_streams(self.channels)
         
         # Check if any streams launched successfully
-        successful_channels = [ch for ch, success in results.items() if success]
-        failed_channels = [ch for ch, success in results.items() if not success]
+        successful_channels = [ch for ch, (success, msg) in results.items() if success]
+        failed_channels = [(ch, msg) for ch, (success, msg) in results.items() if not success]
         
         if failed_channels:
-            logger.warning(f"Failed to launch streams for: {', '.join(failed_channels)}")
+            for channel, message in failed_channels:
+                print(f"[SKIP] {message}")
+                logger.warning(f"{message}")
         
         if not successful_channels:
-            logger.error("All streams failed to launch. Exiting.")
+            logger.error("No streams are live. Exiting.")
+            print("\nNo channels are currently live. Please try again later.")
             return
         
         logger.info(f"Successfully launched {len(successful_channels)} stream(s)")
@@ -248,9 +251,15 @@ class TwitchViewer:
                 if self.stream_manager:
                     dead = self.stream_manager.check_streams()
                     if dead:
-                        for channel in dead:
+                        for channel, reason in dead:
                             if self.ui:
-                                self.ui.set_status(f"⚠ Stream for #{channel} has died")
+                                if reason == "offline":
+                                    self.ui.set_status(f"Channel #{channel} has gone OFFLINE")
+                                    logger.info(f"Channel {channel} went offline")
+                                elif reason == "max_retries":
+                                    self.ui.set_status(f"Stream for #{channel} failed after max retries")
+                                else:
+                                    self.ui.set_status(f"Connection lost for #{channel}")
                 
                 # Update recording status in UI
                 if self.recording_manager and self.ui and isinstance(self.ui, MultiChannelUI):

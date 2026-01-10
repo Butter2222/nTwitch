@@ -1,11 +1,21 @@
 import subprocess
 import time
 import logging
+import json
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+from enum import Enum
 
 
 logger = logging.getLogger(__name__)
+
+
+class StreamStatus(Enum):
+    """Stream status enum."""
+    LIVE = "live"
+    OFFLINE = "offline"
+    NOT_FOUND = "not_found"
+    ERROR = "error"
 
 
 @dataclass
@@ -37,38 +47,88 @@ class StreamManager:
         self._restart_count: Dict[str, int] = {}  # Track restart attempts per channel
         self._max_restarts_per_channel = 3  # Max auto-restarts before giving up
     
-    def launch_streams(self, channels: List[str]) -> Dict[str, bool]:
+    def check_stream_status(self, channel: str) -> Tuple[StreamStatus, str]:
+        """
+        Check if a stream is live using streamlink --json.
+        
+        Returns (StreamStatus, message)
+        """
+        try:
+            cmd = ["streamlink", "--json", f"twitch.tv/{channel}"]
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout)
+                    # Check if streams are available
+                    if data.get("streams"):
+                        return StreamStatus.LIVE, f"Channel '{channel}' is live"
+                    else:
+                        return StreamStatus.OFFLINE, f"Channel '{channel}' is currently offline"
+                except json.JSONDecodeError:
+                    return StreamStatus.ERROR, f"Could not parse stream data for '{channel}'"
+            else:
+                # Check error message
+                stderr = result.stderr.lower()
+                if "no plugin" in stderr or "unable to find" in stderr or "not found" in stderr:
+                    return StreamStatus.NOT_FOUND, f"Channel '{channel}' does not exist"
+                else:
+                    return StreamStatus.OFFLINE, f"Channel '{channel}' is currently offline"
+                    
+        except subprocess.TimeoutExpired:
+            return StreamStatus.ERROR, f"Timeout checking status for '{channel}'"
+        except FileNotFoundError:
+            return StreamStatus.ERROR, "Streamlink not found"
+        except Exception as e:
+            return StreamStatus.ERROR, f"Error checking '{channel}': {str(e)}"
+    
+    def launch_streams(self, channels: List[str]) -> Dict[str, Tuple[bool, str]]:
         """
         Launch VLC streams for multiple channels.
         
-        Returns dict mapping channel names to success status.
+        Returns dict mapping channel names to (success, message) tuples.
         """
         results = {}
         
         for i, channel in enumerate(channels):
-            logger.info(f"Launching stream for channel: {channel}")
+            logger.info(f"Checking status for channel: {channel}")
             
-            try:
-                process = self._launch_single_stream(channel)
-                if process:
-                    self.streams.append(StreamProcess(
-                        channel=channel,
-                        process=process,
-                        pid=process.pid
-                    ))
-                    results[channel] = True
-                    logger.info(f"[OK] Stream launched for {channel} (PID: {process.pid})")
-                else:
-                    results[channel] = False
-                    logger.error(f"[FAIL] Failed to launch stream for {channel}")
-                
-                # Delay between launches to prevent race conditions
-                if i < len(channels) - 1:
-                    time.sleep(2)
+            # Check if stream is live before attempting to launch
+            status, message = self.check_stream_status(channel)
+            
+            if status == StreamStatus.LIVE:
+                logger.info(f"{channel} is live, launching stream...")
+                try:
+                    process = self._launch_single_stream(channel)
+                    if process:
+                        self.streams.append(StreamProcess(
+                            channel=channel,
+                            process=process,
+                            pid=process.pid
+                        ))
+                        results[channel] = (True, f"Stream launched for {channel}")
+                        logger.info(f"[OK] Stream launched for {channel} (PID: {process.pid})")
+                    else:
+                        results[channel] = (False, f"Failed to launch stream for {channel}")
+                        logger.error(f"[FAIL] Failed to launch stream for {channel}")
                     
-            except Exception as e:
-                logger.error(f"Error launching stream for {channel}: {e}")
-                results[channel] = False
+                    # Delay between launches to prevent race conditions
+                    if i < len(channels) - 1:
+                        time.sleep(2)
+                        
+                except Exception as e:
+                    logger.error(f"Error launching stream for {channel}: {e}")
+                    results[channel] = (False, f"Error: {str(e)}")
+            else:
+                # Stream is not live or doesn't exist
+                results[channel] = (False, message)
+                logger.warning(f"[SKIP] {message}")
         
         return results
     
@@ -129,23 +189,42 @@ class StreamManager:
             logger.error(f"Error launching stream: {e}")
             return None
     
-    def check_streams(self) -> List[str]:
-        """Check which streams are still running. Returns list of dead channels."""
+    def check_streams(self) -> List[Tuple[str, str]]:
+        """
+        Check which streams are still running.
+        
+        Returns list of (channel, reason) tuples:
+        - reason can be: "offline", "connection_error", or "max_retries"
+        """
         dead_channels = []
         
         for stream in self.streams:
             if stream.process.poll() is not None:
-                dead_channels.append(stream.channel)
-                logger.warning(f"Stream for {stream.channel} has died")
+                logger.warning(f"Stream for {stream.channel} has died, checking status...")
                 
-                # Auto-restart if enabled
-                if self.auto_restart:
-                    restart_count = self._restart_count.get(stream.channel, 0)
-                    if restart_count < self._max_restarts_per_channel:
-                        logger.info(f"Attempting to restart stream for {stream.channel} (attempt {restart_count + 1}/{self._max_restarts_per_channel})")
-                        self._restart_stream(stream.channel)
+                # Check if channel is offline or if it's a connection error
+                status, message = self.check_stream_status(stream.channel)
+                
+                if status == StreamStatus.OFFLINE or status == StreamStatus.NOT_FOUND:
+                    # Channel went offline - don't restart
+                    dead_channels.append((stream.channel, "offline"))
+                    logger.warning(f"{message} - stream will not restart")
+                else:
+                    # Connection error or other issue - try to restart if enabled
+                    if self.auto_restart:
+                        restart_count = self._restart_count.get(stream.channel, 0)
+                        if restart_count < self._max_restarts_per_channel:
+                            logger.info(f"Connection issue for {stream.channel}, attempting restart (attempt {restart_count + 1}/{self._max_restarts_per_channel})")
+                            if self._restart_stream(stream.channel):
+                                # Successfully restarted, don't add to dead list
+                                continue
+                            else:
+                                dead_channels.append((stream.channel, "connection_error"))
+                        else:
+                            dead_channels.append((stream.channel, "max_retries"))
+                            logger.error(f"Max restart attempts reached for {stream.channel}, giving up")
                     else:
-                        logger.error(f"Max restart attempts reached for {stream.channel}, giving up")
+                        dead_channels.append((stream.channel, "connection_error"))
         
         # Remove dead streams from list (but not restarted ones)
         self.streams = [s for s in self.streams if s.process.poll() is None]
@@ -241,4 +320,3 @@ def parse_channel_input(input_str: str) -> List[str]:
     
     return channels
         # Remove trailing slashes
-        

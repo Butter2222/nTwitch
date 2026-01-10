@@ -1,63 +1,341 @@
-"""Terminal UI with split-pane layout for multi-channel chat."""
 import asyncio
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 from collections import deque
-from blessed import Terminal
-from chat_client import ChatMessage
+from datetime import datetime
 
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.widgets import Static, Input, Footer, Header, RichLog
+from textual.reactive import reactive
+from textual.binding import Binding
+from textual import work, events
+from rich.text import Text
+from rich.style import Style
+
+from chat_client import ChatMessage
 
 logger = logging.getLogger(__name__)
 
 
-class ChannelPane:
-    """Represents a single channel pane in the UI."""
+class ChatInput(Input):
+    """Custom Input that doesn't capture Tab key."""
+    
+    BINDINGS = [
+        # Override Tab binding to do nothing, letting it bubble up
+    ]
+
+
+class ChannelPane(Static):
+    """A single channel chat pane widget."""
+    
+    DEFAULT_CSS = """
+    ChannelPane {
+        border: solid #babaff;
+        height: 100%;
+        width: 1fr;
+        background: #1e1e1e;
+        overflow: hidden;
+    }
+    
+    ChannelPane.recording {
+        border: solid #ff0000 !important;
+        background: #1e1e1e;
+    }
+    
+    ChannelPane > RichLog {
+        height: 1fr;
+        background: #1e1e1e;
+        color: #ffffff;
+        padding: 0 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+    }
+    
+    ChannelPane .channel-header {
+        text-align: center;
+        background: #2d2d2d;
+        color: #ffffff;
+        padding: 0 1;
+        text-style: bold;
+    }
+    
+    ChannelPane.recording .channel-header {
+        background: #ff0000;
+        color: #ffffff;
+    }
+    """
     
     def __init__(self, channel: str, max_messages: int = 200):
         """Initialize channel pane."""
+        super().__init__()
         self.channel = channel
+        self.max_messages = max_messages
         self.messages: deque = deque(maxlen=max_messages)
-        self.scroll_offset = 0
+        self.is_active = False
+        self.is_recording = False
+        self.recording_duration = ""
     
-    def add_message(self, message: ChatMessage):
+    def compose(self) -> ComposeResult:
+        """Create child widgets."""
+        header_text = f">>> {self.channel.upper()} <<<"
+        if self.is_recording:
+            header_text += f" [REC {self.recording_duration}]"
+        
+        yield Static(header_text, classes="channel-header")
+        yield RichLog(max_lines=self.max_messages, wrap=True, markup=True, auto_scroll=True)
+    
+    def add_message(self, message: ChatMessage, my_username: Optional[str] = None):
         """Add a message to the pane."""
         self.messages.append(message)
-        self.scroll_offset = 0  # Reset scroll to bottom
+        
+        # Get the RichLog widget
+        log = self.query_one(RichLog)
+        
+        # Format the message with Rich styling
+        formatted = self._format_message(message, my_username)
+        log.write(formatted)
     
-    def clear(self):
-        """Clear all messages."""
+    def _format_message(self, message: ChatMessage, my_username: Optional[str] = None) -> Text:
+        """Format a chat message with Rich Text styling."""
+        text = Text()
+        
+        # Add badge if present
+        badge = message.get_badge_text()
+        if badge:
+            if message.is_broadcaster():
+                text.append(f"{badge} ", style="bold red")
+            elif message.is_moderator():
+                text.append(f"{badge} ", style="bold green")
+            else:
+                text.append(f"{badge} ", style="bold")
+        
+        # Add username with color
+        username_style = self._get_username_style(message)
+        text.append(f"{message.author}", style=username_style)
+        text.append(": ", style="white")
+        
+        # Add message content with mention highlighting
+        content = message.content
+        if my_username and f"@{my_username}" in content.lower():
+            # Highlight mentions
+            import re
+            parts = re.split(f'(@{re.escape(my_username)})', content, flags=re.IGNORECASE)
+            for part in parts:
+                if part.lower() == f"@{my_username}".lower():
+                    text.append(part, style="bold yellow on dark_blue")
+                else:
+                    text.append(part, style="white")
+        else:
+            text.append(content, style="white")
+        
+        # Force wrapping by setting overflow
+        text.overflow = "fold"
+        
+        return text
+    
+    def _get_username_style(self, message: ChatMessage) -> Style:
+        """Get Rich style for username based on user type."""
+        if message.is_broadcaster():
+            return Style(color="red", bold=True)
+        elif message.is_moderator():
+            return Style(color="green", bold=True)
+        elif message.color:
+            # Use Twitch user color
+            try:
+                color = message.color.lstrip('#')
+                return Style(color=f"#{color}")
+            except:
+                pass
+        elif message.is_subscriber():
+            return Style(color="magenta")
+        elif message.is_vip():
+            return Style(color="magenta", bold=True)
+        
+        return Style(color="white")
+    
+    def clear_messages(self):
+        """Clear all messages from the pane."""
         self.messages.clear()
-        self.scroll_offset = 0
-
-
-class MultiChannelUI:
-    """Multi-channel terminal UI with split-pane layout."""
+        log = self.query_one(RichLog)
+        log.clear()
     
-    def __init__(self, channels: List[str], is_authenticated: bool = True, recording_manager=None, clip_manager=None, username: Optional[str] = None):
+    def set_active(self, active: bool):
+        """Set whether this pane is active."""
+        self.is_active = active
+        if active:
+            self.add_class("active")
+        else:
+            self.remove_class("active")
+        self._update_header()
+        # Force visual refresh
+        self.refresh(layout=True)
+    
+    def set_recording(self, recording: bool, duration: str = ""):
+        """Set recording status."""
+        self.is_recording = recording
+        self.recording_duration = duration
+        if recording:
+            self.add_class("recording")
+        else:
+            self.remove_class("recording")
+        self._update_header()
+    
+    def _update_header(self):
+        """Update the header text."""
+        header_text = f">>> {self.channel.upper()} <<<"
+        if self.is_recording:
+            header_text += f" [REC {self.recording_duration}]"
+        
+        # Only update if the widget is mounted
+        try:
+            header = self.query_one(".channel-header", Static)
+            header.update(header_text)
+        except:
+            pass  # Widget not mounted yet
+
+
+class StatusBar(Static):
+    """Status bar showing active channel and info."""
+    
+    DEFAULT_CSS = """
+    StatusBar {
+        dock: bottom;
+        height: 1;
+        background: #babaff;
+        color: $text;
+        padding: 0 1;
+    }
+    """
+    
+    status_text = reactive("")
+    
+    def render(self) -> str:
+        """Render the status text."""
+        return self.status_text
+    
+    def set_status(self, text: str):
+        """Set the status text."""
+        self.status_text = text
+
+
+class MultiChannelUI(App):
+    """Textual-based multi-channel Twitch viewer UI."""
+    
+    # Remove app title from header
+    TITLE = ""
+    
+    # Reactive property for placeholder text
+    input_placeholder = reactive("")
+    
+    CSS = """
+    Screen {
+        background: $background;
+    }
+    
+    #channels-container {
+        height: 1fr;
+        layout: horizontal;
+    }
+    
+    #input-container {
+        dock: bottom;
+        height: auto;
+        background: $surface;
+        border-top: solid #babaff;
+        padding: 1;
+    }
+    
+    #input-container Input {
+        width: 100%;
+        background: $surface;
+        color: $text;
+        border: solid #babaff;
+        height: 3;
+    }
+    
+    Footer {
+        background: $panel;
+        color: $text;
+    }
+    
+    /* Hide scrollbars for cleaner look */
+    RichLog {
+        scrollbar-size: 0 0;
+        overflow-y: auto;
+    }
+    
+    /* Custom accent color */
+    $accent: #babaff;
+    """
+    
+    BINDINGS = [
+        Binding("f1", "cycle_channel", "Next Channel", show=True),
+        Binding("f2", "toggle_recording", "Record", show=True),
+        Binding("f3", "save_clip", "Clip", show=True),
+        Binding("f4", "switch_streamers", "Switch", show=True),
+        Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("ctrl+c", "quit", "Exit", show=True),
+    ]
+    
+    # Constants
+    MAX_MESSAGES_PER_PANE = 200
+    MAX_VISIBLE_PANES = 4
+    
+    def __init__(self, channels: List[str], is_authenticated: bool = True, 
+                 recording_manager=None, clip_manager=None, username: Optional[str] = None):
         """Initialize the UI."""
-        self.term = Terminal()
-        self.channels = channels
-        self.panes: Dict[str, ChannelPane] = {
-            channel: ChannelPane(channel) for channel in channels
-        }
-        self.active_channel_index = 0
+        super().__init__()
+        self.channels = channels[:self.MAX_VISIBLE_PANES]
         self.is_authenticated = is_authenticated
-        self.input_buffer = ""
-        self.running = False
-        self.status_message = ""
-        self.status_timestamp = None  # Track when status was set
         self.recording_manager = recording_manager
         self.clip_manager = clip_manager
-        self._my_username = username.lower() if username else None
+        self.my_username = username.lower() if username else None
+        self.active_channel_index = 0
         
-        # Color codes for user types
-        self.colors = {
-            'broadcaster': self.term.red,
-            'moderator': self.term.green,
-            'subscriber': self.term.blue,
-            'vip': self.term.magenta,
-            'regular': self.term.white
-        }
+        # Callbacks
+        self.send_callback: Optional[Callable] = None
+        self.recording_callback: Optional[Callable] = None
+        self.clip_callback: Optional[Callable] = None
+        self.switch_callback: Optional[Callable] = None
+        self.channel_change_callback: Optional[Callable] = None
+        
+        # Panes dictionary
+        self.panes: Dict[str, ChannelPane] = {}
+        
+        # Status tracking
+        self.status_message = ""
+        self.status_timestamp = None
+    
+    def compose(self) -> ComposeResult:
+        """Create child widgets."""
+        yield Header(show_clock=True)
+        
+        # Channels container
+        with Horizontal(id="channels-container"):
+            for channel in self.channels:
+                pane = ChannelPane(channel, max_messages=self.MAX_MESSAGES_PER_PANE)
+                self.panes[channel] = pane
+                yield pane
+        
+        # Input container
+        if self.is_authenticated:
+            with Container(id="input-container"):
+                yield ChatInput(placeholder=f"Type message for #{self.get_active_channel()}...")
+        
+        # Status bar
+        yield StatusBar()
+        
+        # Footer with keybinds
+        yield Footer()
+    
+    def on_mount(self) -> None:
+        """Called when app is mounted."""
+        # Set first channel as active after mounting
+        if self.channels and self.channels[0] in self.panes:
+            self.panes[self.channels[0]].set_active(True)
+        
+        self._update_status()
     
     def get_active_channel(self) -> str:
         """Get the currently active channel name."""
@@ -65,464 +343,164 @@ class MultiChannelUI:
             return self.channels[self.active_channel_index]
         return self.channels[0] if self.channels else ""
     
-    def cycle_active_channel(self):
-        """Cycle to the next channel."""
-        if len(self.channels) > 1:
-            self.active_channel_index = (self.active_channel_index + 1) % len(self.channels)
-    
     def add_message(self, message: ChatMessage):
-        """Route message to appropriate channel pane."""
+        """Add a message to the appropriate channel pane."""
         if message.channel in self.panes:
-            self.panes[message.channel].add_message(message)
+            pane = self.panes[message.channel]
+            pane.add_message(message, self.my_username)
     
     def set_status(self, message: str):
-        """Set status message with timestamp for auto-clear."""
+        """Set status message."""
         import time
         self.status_message = message
         self.status_timestamp = time.time()
+        self._update_status()
+        
+        # Auto-clear after 10 seconds
+        self.set_timer(10, self._clear_status_if_old)
     
-    def render(self):
-        """Render the entire UI."""
-        # Clear screen properly for stable rendering
-        print(self.term.home + self.term.clear, end='', flush=False)
+    def _clear_status_if_old(self):
+        """Clear status if it's old."""
+        import time
+        if self.status_message and self.status_timestamp:
+            if time.time() - self.status_timestamp >= 10:
+                self.status_message = ""
+                self._update_status()
+    
+    def _update_status(self):
+        """Update the status bar."""
+        status_bar = self.query_one(StatusBar)
         
-        # Calculate dimensions
-        term_width = self.term.width
-        term_height = self.term.height
+        if self.status_message:
+            status_bar.set_status(self.status_message)
+        else:
+            active_channel = self.get_active_channel()
+            recording_info = ""
+            
+            if self.recording_manager:
+                for channel in self.channels:
+                    if self.recording_manager.is_recording(channel):
+                        duration = self.recording_manager.get_recording_info(channel)
+                        recording_info = f" | Recording {channel.upper()} {duration}"
+            
+            status_text = f"Selected: #{active_channel.upper()}{recording_info}"
+            status_bar.set_status(status_text)
         
-        # Minimum size check
-        if term_width < 120 or term_height < 20:
-            self._render_fallback_mode()
+        # Update panes with recording status
+        if self.recording_manager:
+            for channel in self.channels:
+                if channel in self.panes:
+                    is_recording = self.recording_manager.is_recording(channel)
+                    duration = self.recording_manager.get_recording_info(channel) if is_recording else ""
+                    self.panes[channel].set_recording(is_recording, duration)
+    
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle input submission."""
+        if not self.is_authenticated or not self.send_callback:
             return
         
-        # Calculate pane dimensions
-        num_panes = min(len(self.channels), 4)  # Max 4 visible panes
-        pane_width = term_width // num_panes
-        chat_height = term_height - 5  # Reserve 5 lines for input, status, and keybinds
-        
-        # Render each channel pane
-        for i, channel in enumerate(self.channels[:num_panes]):
-            x_offset = i * pane_width
-            self._render_pane(channel, x_offset, 0, pane_width, chat_height)
-        
-        # Render input area (now with 4 lines instead of 3)
-        self._render_input(term_height - 4)
+        message = event.value.strip()
+        if message:
+            # ALWAYS get the current active channel at send time
+            active_channel = self.channels[self.active_channel_index]
+            # Show which channel we're sending to in the status bar
+            self.set_status(f"→ Sending to #{active_channel}: {message[:50]}")
+            logger.info(f"[SEND] Active index: {self.active_channel_index}, Channel: {active_channel}, Message: {message}")
+            await self.send_callback(active_channel, message)
+            event.input.value = ""
     
-    def _render_pane(self, channel: str, x: int, y: int, width: int, height: int):
-        """Render a single channel pane."""
-        pane = self.panes[channel]
+    def action_cycle_channel(self) -> None:
+        """Cycle to next channel."""
+        if len(self.channels) <= 1:
+            return
         
-        # Build header with recording status and active indicator
-        channel_upper = channel.upper()
+        # Deactivate current
+        current_channel = self.get_active_channel()
+        if current_channel in self.panes:
+            self.panes[current_channel].set_active(False)
         
-        # Check if this is the active channel
-        is_active = (channel == self.get_active_channel())
-        active_indicator = "★ " if is_active else ""
+        # Move to next
+        old_index = self.active_channel_index
+        self.active_channel_index = (self.active_channel_index + 1) % len(self.channels)
         
-        # Check if recording
-        recording_indicator = ""
-        if self.recording_manager and self.recording_manager.is_recording(channel):
-            duration = self.recording_manager.get_recording_info(channel)
-            recording_indicator = f" [REC {duration}]"
+        # Activate new
+        new_channel = self.get_active_channel()
+        if new_channel in self.panes:
+            self.panes[new_channel].set_active(True)
         
-        header = f" {active_indicator}>>> {channel_upper}{recording_indicator} <<<"
+        # Debug: Show the switch
+        logger.info(f"[TAB] Switched from index {old_index} ({current_channel}) to index {self.active_channel_index} ({new_channel})")
+        self.set_status(f"Switched to #{new_channel.upper()} - Messages will go here")
         
-        # Truncate if too long
-        if len(header) > width - 2:
-            header = f"{active_indicator}#{channel_upper}"[:width-2]
+        # Update input placeholder using the reactive property
+        self.input_placeholder = f"Type message for #{new_channel}..."
+        if self.is_authenticated:
+            try:
+                input_widget = self.query_one(Input)
+                # Directly set the placeholder attribute
+                input_widget.placeholder = self.input_placeholder
+            except Exception as e:
+                logger.debug(f"Failed to update placeholder: {e}")
         
-        # Center header
-        padding = (width - len(header)) // 2
-        header_line = " " * padding + header + " " * (width - padding - len(header))
-        
-        # Use bright colors for visibility
-        if self.recording_manager and self.recording_manager.is_recording(channel):
-            # Red if recording
-            color_func = self.term.bright_red
-        elif is_active:
-            # Yellow if active (ready to record or send messages)
-            color_func = self.term.bright_yellow
-        else:
-            # Cyan for inactive channels
-            color_func = self.term.bright_cyan
-        
-        with self.term.location(x, y):
-            print(color_func(self.term.bold(header_line[:width])) + self.term.clear_eol)
-        
-        # Simple separator
-        with self.term.location(x, y + 1):
-            print(("-" * width) + self.term.clear_eol)
-        
-        # Draw messages (simple truncation - stable rendering)
-        visible_messages = list(pane.messages)[-(height - 2):]  # -2 for header and separator
-        
-        for i, msg in enumerate(visible_messages):
-            line_y = y + 2 + i
-            formatted = self._format_message(msg, width - 2, include_channel=False)
-            with self.term.location(x + 1, line_y):
-                print(formatted + self.term.clear_eol)
-        
-        # Clear any remaining lines in this pane
-        for i in range(len(visible_messages), height - 2):
-            line_y = y + 2 + i
-            with self.term.location(x + 1, line_y):
-                print(self.term.clear_eol)
+        # Notify callback
+        if self.channel_change_callback:
+            asyncio.create_task(self.channel_change_callback(new_channel))
     
-    def _format_and_wrap_message(self, message: ChatMessage, max_width: int, include_channel: bool = False) -> List[str]:
-        """Format and wrap a chat message across multiple lines."""
-        # Get badge text
-        badge = message.get_badge_text()
+    async def action_toggle_recording(self) -> None:
+        """Toggle recording for active channel."""
+        if not self.recording_callback:
+            return
         
-        # Determine username color
-        username_color = None
-        if message.is_broadcaster():
-            username_color = self.term.bright_red
-        elif message.is_moderator():
-            username_color = self.term.bright_green
-        elif message.color:
-            username_color = self._hex_to_term_color(message.color)
-        else:
-            username_color = self.term.white
-        
-        # Add channel tag if requested
-        channel_tag = ""
-        if include_channel:
-            is_active = (message.channel == self.get_active_channel())
-            channel_name = message.channel[:4].upper()
-            if is_active:
-                channel_tag = f"{self.term.bright_yellow}[{channel_name}]{self.term.normal} "
-            else:
-                channel_tag = f"[{channel_name}] "
-        
-        # Build formatted header
-        prefix = f"{badge} " if badge else ""
-        author_part = f"{username_color}{message.author}{self.term.normal}"
-        
-        # Calculate visible header length
-        visible_channel_len = len(message.channel[:4]) + 3 if include_channel else 0
-        visible_prefix_len = len(prefix)
-        visible_author_len = len(message.author)
-        visible_header_len = visible_channel_len + visible_prefix_len + visible_author_len + 2  # +2 for ": "
-        
-        # First line with header
-        first_line_space = max_width - visible_header_len
-        
-        # Handle mentions
-        content = message.content
-        if self.is_authenticated and hasattr(self, '_my_username') and self._my_username:
-            mention = f"@{self._my_username}"
-            if mention.lower() in content.lower():
-                import re
-                content = re.sub(
-                    f"({re.escape(mention)})", 
-                    f"{self.term.bright_yellow}\\1{self.term.normal}",
-                    content,
-                    flags=re.IGNORECASE
-                )
-        
-        # Word wrap the content
-        words = message.content.split()  # Use original for splitting
-        lines = []
-        current_line = []
-        current_length = 0
-        is_first_line = True
-        
-        for word in words:
-            word_len = len(word)
-            space_len = 1 if current_line else 0
-            
-            # Check if word fits on current line
-            line_space = first_line_space if is_first_line else max_width - 2  # -2 for continuation indent
-            
-            if current_length + space_len + word_len <= line_space:
-                current_line.append(word)
-                current_length += space_len + word_len
-            else:
-                # Save current line
-                if current_line:
-                    line_text = ' '.join(current_line)
-                    if is_first_line:
-                        lines.append(f"{channel_tag}{prefix}{author_part}: {line_text}")
-                        is_first_line = False
-                    else:
-                        lines.append(f"  {line_text}")  # Continuation indent
-                    current_line = []
-                    current_length = 0
-                
-                # Start new line with current word
-                current_line.append(word)
-                current_length = word_len
-        
-        # Add remaining words
-        if current_line:
-            line_text = ' '.join(current_line)
-            if is_first_line:
-                lines.append(f"{channel_tag}{prefix}{author_part}: {line_text}")
-            else:
-                lines.append(f"  {line_text}")
-        
-        # If no lines were created (empty message), create one
-        if not lines:
-            lines.append(f"{channel_tag}{prefix}{author_part}: ")
-        
-        return lines
-    
-    def _format_message(self, message: ChatMessage, max_width: int, include_channel: bool = False) -> str:
-        """Format a chat message with colors."""
-        # Get badge text with role-based color (meaningful!)
-        badge = message.get_badge_text()
-        
-        # Determine username color
-        # Priority: Role-based color for special roles, then Twitch user color, then default
-        username_color = None
-        
-        if message.is_broadcaster():
-            # Broadcaster: Always bright red (most important role)
-            username_color = self.term.bright_red
-        elif message.is_moderator():
-            # Moderator: Always green (authority figure)
-            username_color = self.term.bright_green
-        elif message.color:
-            # Regular user with custom Twitch color: Use their chosen color
-            username_color = self._hex_to_term_color(message.color)
-        elif message.is_subscriber():
-            # Subscriber without custom color: Purple
-            username_color = self.term.bright_magenta
-        elif message.is_vip():
-            # VIP without custom color: Magenta
-            username_color = self.term.magenta
-        else:
-            # Default: White
-            username_color = self.term.white
-        
-        # Add channel tag if requested - ORANGE if active channel!
-        channel_tag = ""
-        if include_channel:
-            is_active = (message.channel == self.get_active_channel())
-            channel_name = message.channel[:4].upper()
-            if is_active:
-                # Active channel = ORANGE
-                channel_tag = f"{self.term.bright_yellow}[{channel_name}]{self.term.normal} "
-            else:
-                # Inactive channel = default color
-                channel_tag = f"[{channel_name}] "
-        
-        # Build formatted message
-        prefix = f"{badge} " if badge else ""
-        author_part = f"{username_color}{message.author}{self.term.normal}"
-        
-        # Check for mentions - highlight @username
-        content = message.content
-        # Only check if we're authenticated (know our username)
-        if self.is_authenticated and hasattr(self, '_my_username'):
-            mention = f"@{self._my_username}"
-            if mention.lower() in content.lower():
-                # Highlight mentions in bright yellow
-                import re
-                content = re.sub(
-                    f"({re.escape(mention)})", 
-                    f"{self.term.bright_yellow}\\1{self.term.normal}",
-                    content,
-                    flags=re.IGNORECASE
-                )
-        
-        # Calculate VISIBLE lengths (without ANSI codes)
-        # For channel tag: either [CHAN] (6 chars) + space = 7, regardless of color
-        visible_channel_len = len(message.channel[:4]) + 3 if include_channel else 0  # [XXXX] + space
-        visible_prefix_len = len(prefix)
-        visible_author_len = len(message.author)
-        
-        # Calculate how much space we have for the message content
-        visible_header_len = visible_channel_len + visible_prefix_len + visible_author_len + 2  # +2 for ": "
-        
-        # Get visible length of content (without ANSI codes)
-        visible_content_len = len(message.content)  # Use original for length calc
-        
-        # Truncate message content if needed
-        if visible_header_len + visible_content_len > max_width:
-            content_space = max_width - visible_header_len - 3  # -3 for "..."
-            if content_space > 0:
-                content = message.content[:content_space] + "..."
-            else:
-                content = message.content[:max(0, max_width - visible_header_len)]
-        
-        return f"{channel_tag}{prefix}{author_part}: {content}"
-    
-    def _hex_to_term_color(self, hex_color: str):
-        """Convert Twitch hex color to closest terminal color."""
-        if not hex_color or not hex_color.startswith('#'):
-            return self.term.white
-        
-        try:
-            # Remove # and convert to RGB
-            hex_color = hex_color.lstrip('#')
-            r = int(hex_color[0:2], 16)
-            g = int(hex_color[2:4], 16)
-            b = int(hex_color[4:6], 16)
-            
-            # Map to closest bright terminal color for better visibility
-            # These thresholds create good visual variety
-            if r > 200 and g < 100 and b < 100:
-                return self.term.bright_red
-            elif r < 100 and g > 200 and b < 100:
-                return self.term.bright_green
-            elif r < 100 and g < 100 and b > 200:
-                return self.term.bright_blue
-            elif r > 200 and g > 200 and b < 100:
-                return self.term.bright_yellow
-            elif r > 200 and g < 100 and b > 200:
-                return self.term.bright_magenta
-            elif r < 100 and g > 200 and b > 200:
-                return self.term.bright_cyan
-            elif r > 150:  # Orangish colors
-                return self.term.yellow
-            elif g > 150:  # Greenish colors
-                return self.term.green
-            elif b > 150:  # Bluish colors
-                return self.term.blue
-            elif r > 100 and g > 100:  # Brown/tan
-                return self.term.yellow
-            else:
-                return self.term.white
-                
-        except (ValueError, IndexError):
-            return self.term.white
-    
-    def _render_input(self, y: int):
-        """Render input area at the bottom with 4 lines total."""
-        import time
         active_channel = self.get_active_channel()
-        
-        # Auto-clear ALL status messages after 5 seconds
-        if self.status_message and self.status_timestamp:
-            elapsed = time.time() - self.status_timestamp
-            if elapsed > 5.0:
-                self.status_message = ""
-                self.status_timestamp = None
-        
-        # Line 1: Separator
-        with self.term.location(0, y):
-            print("═" * self.term.width)
-        
-        # Line 2: Active channel indicator with recording status
-        with self.term.location(0, y + 1):
-            if self.is_authenticated:
-                # Check if any channel is recording and show timer
-                recording_info = ""
-                if self.recording_manager:
-                    for channel in self.channels:
-                        if self.recording_manager.is_recording(channel):
-                            duration = self.recording_manager.get_recording_info(channel)
-                            recording_info = f"  |  {self.term.bright_red}Recording {channel.upper()} {duration}{self.term.normal}"
-                
-                status_line = f"SELECTED: {active_channel.upper()} (Press [Tab] to switch, [F2] to record THIS channel){recording_info}"
-            else:
-                status_line = "(Read-only mode - Configure OAuth to chat)"
-            print(self.term.bold(self.term.yellow(status_line)))
-        
-        # Line 3: Input buffer or status message
-        with self.term.location(0, y + 2):
-            if self.status_message:
-                # Show status message in yellow
-                print(self.term.yellow(self.status_message[:self.term.width]))
-            elif self.is_authenticated and self.input_buffer:
-                # Show input buffer when typing
-                print(f"> {self.input_buffer}_"[:self.term.width])
-            else:
-                # Show empty input prompt
-                print("> "[:self.term.width])
-        
-        # Line 4: ALWAYS VISIBLE KEYBINDS at the very bottom
-        with self.term.location(0, y + 3):
-            if self.is_authenticated:
-                keybinds = "[Tab] Select  [F2] Record  [F3] Clip  [F4] Switch  [Enter] Send  [Ctrl+L] Clear  [Ctrl+C] Exit"
-            else:
-                keybinds = "[Tab] Select  [F2] Record  [F3] Clip  [F4] Switch  [Ctrl+L] Clear  [Ctrl+C] Exit"
-            # Always show keybinds in cyan to make them stand out
-            print(self.term.cyan(keybinds[:self.term.width]))
+        is_recording, message = await self.recording_callback(active_channel)
+        self.set_status(message)
+        self._update_status()
     
-    def _render_fallback_mode(self):
-        """Render simplified UI when terminal is too small."""
-        print(self.term.home + self.term.clear)
-        print(self.term.bold(self.term.red("Terminal too small!")))
-        print(f"Minimum size: 120x20")
-        print(f"Current size: {self.term.width}x{self.term.height}")
-        print("\nPlease resize your terminal window.")
+    async def action_save_clip(self) -> None:
+        """Save a clip of the active channel."""
+        if not self.clip_callback:
+            return
+        
+        active_channel = self.get_active_channel()
+        success, message = await self.clip_callback(active_channel)
+        self.set_status(message)
     
-    async def handle_input(self, key: str, send_callback, recording_callback=None, clip_callback=None, switch_callback=None, channel_change_callback=None):
-        """Handle keyboard input."""
-        # Tab key - Select Channel
-        if key == '\t':
-            self.cycle_active_channel()
-            if channel_change_callback:
-                await channel_change_callback(self.get_active_channel())
-            self.render()
-        # Function key handling (Unix and Windows)
-        elif key == '\x1bOQ' or key == 'KEY_F(2)' or key == 'KEY_F2':  # F2 key - toggle recording
-            if recording_callback:
-                active_channel = self.get_active_channel()
-                is_recording, message = await recording_callback(active_channel)
-                self.set_status(message)
-                self.render()
-        elif key == '\x1bOR' or key == 'KEY_F(3)' or key == 'KEY_F3':  # F3 key - save clip
-            if clip_callback:
-                active_channel = self.get_active_channel()
-                success, message = await clip_callback(active_channel)
-                self.set_status(message)
-                self.render()
-        elif key == '\x1bOS' or key == 'KEY_F(4)' or key == 'KEY_F4':  # F4 key - switch streamers
-            if switch_callback:
-                await switch_callback()
-                return  # Exit after switching
-        elif key == '\n' or key == '\r':  # Enter key
-            if self.input_buffer and self.is_authenticated:
-                # Send message
-                active_channel = self.get_active_channel()
-                await send_callback(active_channel, self.input_buffer)
-                
-                # Clear input
-                self.input_buffer = ""
-                self.render()
-        elif key == '\x7f':  # Backspace
-            if self.input_buffer:
-                self.input_buffer = self.input_buffer[:-1]
-                self.render()
-        elif key == '\x0c':  # Ctrl+L
-            # Clear active channel
-            active_channel = self.get_active_channel()
-            if active_channel in self.panes:
-                self.panes[active_channel].clear()
-                self.set_status(f"Cleared #{active_channel}")
-                self.render()
-        elif len(key) == 1 and key.isprintable():
-            # Regular character
-            if len(self.input_buffer) < 500:  # Twitch message limit
-                self.input_buffer += key
-                self.render()
+    async def action_switch_streamers(self) -> None:
+        """Switch to different streamers."""
+        if self.switch_callback:
+            await self.switch_callback()
     
-    def start(self):
-        """Start the UI."""
-        self.running = True
-        print(self.term.enter_fullscreen())
-        print(self.term.hide_cursor())
-        self.render()
+    def action_clear_chat(self) -> None:
+        """Clear the active channel's chat."""
+        active_channel = self.get_active_channel()
+        if active_channel in self.panes:
+            self.panes[active_channel].clear_messages()
+            self.set_status(f"Cleared #{active_channel}")
+    
+    def set_callbacks(self, send_callback, recording_callback=None, clip_callback=None,
+                      switch_callback=None, channel_change_callback=None):
+        """Set callback functions."""
+        self.send_callback = send_callback
+        self.recording_callback = recording_callback
+        self.clip_callback = clip_callback
+        self.switch_callback = switch_callback
+        self.channel_change_callback = channel_change_callback
     
     def stop(self):
-        """Stop the UI and restore terminal."""
-        self.running = False
-        print(self.term.exit_fullscreen())
-        print(self.term.normal_cursor())
-        print(self.term.clear())
+        """Stop the UI."""
+        try:
+            self.exit()
+        except Exception as e:
+            logger.debug(f"Error stopping UI: {e}")
 
 
 class SimpleUI:
-    """Simple non-interactive UI for displaying chat (fallback)."""
+    """Simple fallback UI (non-interactive)."""
     
     def __init__(self, channels: List[str], is_authenticated: bool = True):
         """Initialize simple UI."""
         self.channels = channels
         self.is_authenticated = is_authenticated
-        self.term = Terminal()
     
     def add_message(self, message: ChatMessage):
         """Display a message."""
@@ -532,26 +510,21 @@ class SimpleUI:
     
     def set_status(self, message: str):
         """Display status message."""
-        print(self.term.yellow(f"[STATUS] {message}"))
-    
-    def render(self):
-        """Render (no-op for simple UI)."""
-        pass
+        print(f"[STATUS] {message}")
     
     def start(self):
         """Start the UI."""
-        print(self.term.clear())
-        print(self.term.bold("=== Twitch Terminal Viewer ==="))
+        print("=== Twitch Terminal Viewer ===")
         print(f"Watching: {', '.join(self.channels)}")
         if not self.is_authenticated:
-            print(self.term.yellow("(Read-only mode)"))
+            print("(Read-only mode)")
         print("=" * 40)
-        print()
     
     def stop(self):
         """Stop the UI."""
-        print("\n" + self.term.bold("=== Viewer Closed ==="))
+        print("\n=== Viewer Closed ===")
     
-    async def handle_input(self, key: str, send_callback, recording_callback=None, clip_callback=None, switch_callback=None, channel_change_callback=None):
-        """Handle input (no-op for simple UI)."""
+    async def handle_input(self, key: str, send_callback, recording_callback=None, 
+                          clip_callback=None, switch_callback=None, channel_change_callback=None):
+        """Handle input (no-op)."""
         pass

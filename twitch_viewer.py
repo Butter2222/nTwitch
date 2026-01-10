@@ -1,9 +1,9 @@
-"""Main application entry point for Twitch Terminal Viewer."""
 import asyncio
 import sys
 import argparse
 import logging
 import signal
+import os
 from typing import Optional, Union
 
 from config_manager import ConfigManager
@@ -11,18 +11,21 @@ from setup import run_setup
 from stream_manager import StreamManager, parse_channel_input
 from chat_client import ChatManager, ChatMessage
 from terminal_ui import MultiChannelUI, SimpleUI
-from input_handler import InputHandler
 from recording_manager import RecordingManager
 from clip_manager import ClipManager
 
 
-# Setup logging
+def clear_terminal():
+    """Clear the terminal screen."""
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+# Setup logging - only to file, not terminal
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('twitch_viewer.log'),
-        logging.StreamHandler(sys.stderr)
+        logging.FileHandler('twitch_viewer.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -49,9 +52,8 @@ class TwitchViewer:
         
         # State
         self.running = False
-        self.input_task: Optional[asyncio.Task] = None
-        self.render_task: Optional[asyncio.Task] = None
-        self.input_handler: Optional[InputHandler] = None
+        self.chat_task: Optional[asyncio.Task] = None
+        self.stream_check_task: Optional[asyncio.Task] = None
     
     async def start(self):
         """Start the viewer."""
@@ -115,13 +117,28 @@ class TwitchViewer:
         username = self.config.get('twitch_username', '')
         is_authenticated = bool(token and username)
         
-        # Initialize UI with recording manager and clip manager
+        # Initialize UI
         if self.use_simple_ui:
             self.ui = SimpleUI(channels, is_authenticated)
+            self.ui.start()
         else:
-            self.ui = MultiChannelUI(channels, is_authenticated, self.recording_manager, self.clip_manager, username)
-        
-        self.ui.start()
+            # Initialize Textual UI
+            self.ui = MultiChannelUI(
+                channels, 
+                is_authenticated, 
+                self.recording_manager, 
+                self.clip_manager, 
+                username
+            )
+            
+            # Set up callbacks for the UI
+            self.ui.set_callbacks(
+                send_callback=self._send_message,
+                recording_callback=self._toggle_recording,
+                clip_callback=self._save_clip,
+                switch_callback=self._switch_streamers,
+                channel_change_callback=self._on_channel_change
+            )
         
         # Initialize chat manager
         logger.info("Connecting to Twitch chat...")
@@ -133,36 +150,43 @@ class TwitchViewer:
         )
         
         try:
+            # Connect to chat
             await self.chat_manager.connect()
             logger.info("Connected to chat")
             
-            # Start UI tasks
-            if not self.use_simple_ui:
-                self.input_handler = InputHandler()
-                self.input_task = asyncio.create_task(
-                    self.input_handler.start_input_loop(
-                        self._handle_key,
-                        lambda: setattr(self, 'running', False)
-                    )
-                )
-                self.render_task = asyncio.create_task(self._render_loop())
-                self.recording_update_task = asyncio.create_task(self._recording_update_loop())
-            
-            # Keep running
-            while self.running:
-                await asyncio.sleep(1)
+            if not self.use_simple_ui and isinstance(self.ui, MultiChannelUI):
+                # Start background tasks for Textual UI
+                self.stream_check_task = asyncio.create_task(self._stream_monitor_loop())
                 
-                # Check for dead streams
-                if self.stream_manager:
-                    dead = self.stream_manager.check_streams()
-                    if dead:
-                        for channel in dead:
-                            if self.ui:
-                                self.ui.set_status(f"⚠ Stream for #{channel} has died")
+                # Run the Textual app (this blocks until app exits)
+                await self.ui.run_async()
+            else:
+                # Simple UI - just keep running
+                self.stream_check_task = asyncio.create_task(self._stream_monitor_loop())
+                while self.running:
+                    await asyncio.sleep(1)
                 
         except Exception as e:
             logger.error(f"Error in chat setup: {e}")
-            self.ui.set_status(f"Error: {e}")
+            error_msg = str(e)
+            
+            # Provide user-friendly error messages
+            if "getaddrinfo failed" in error_msg or "Errno 11002" in error_msg:
+                error_msg = "Unable to connect to Twitch chat (DNS error). Check your internet connection."
+            elif "timed out" in error_msg:
+                error_msg = "Connection to Twitch chat timed out. Check your firewall settings."
+            elif "refused" in error_msg:
+                error_msg = "Connection refused by Twitch. Try again later."
+            
+            print(f"\n⚠ Error: {error_msg}")
+            print("Video streams will remain active. Press Ctrl+C to exit.\n")
+            
+            # Wait for user to exit
+            try:
+                while self.running:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                pass
     
     def _on_message(self, message: ChatMessage):
         """Handle incoming chat message."""
@@ -192,55 +216,9 @@ class TwitchViewer:
     
     async def _switch_streamers(self):
         """Switch to different streamers."""
-        # Stop current UI
-        if self.ui:
-            self.ui.stop()
-        
-        # Stop chat
-        if self.chat_manager:
-            await self.chat_manager.disconnect()
-        
-        # Stop streams
-        if self.stream_manager:
-            self.stream_manager.cleanup()
-        
-        # Stop recordings
-        if self.recording_manager:
-            self.recording_manager.cleanup()
-        
-        # Clear console and prompt for new channels
-        print("\n" + "="*60)
-        print("SWITCH STREAMERS")
-        print("="*60)
-        print("Enter new Twitch channel(s) to watch (comma separated)")
-        print("\nExamples:")
-        print("  Single:   xqc")
-        print("  Multiple: xqc, hasanabi, pokimane")
-        print()
-        
-        channel_input = input("Channel(s): ").strip()
-        
-        if not channel_input:
-            print("\nNo channels specified. Exiting.")
-            self.running = False
-            return
-        
-        from stream_manager import parse_channel_input
-        new_channels = parse_channel_input(channel_input)
-        
-        if not new_channels:
-            print("Error: No valid channels specified. Exiting.")
-            self.running = False
-            return
-        
-        # Update channels
-        self.channels = new_channels
-        
-        print(f"\nSwitching to: {', '.join(new_channels)}")
-        print("Please wait...\n")
-        
-        # Restart with new channels
-        await self.start()
+        # Exit the app which will return control to the main loop
+        if self.ui and isinstance(self.ui, MultiChannelUI):
+            self.ui.exit()
     
     async def _toggle_recording(self, channel: str) -> tuple[bool, str]:
         """Toggle recording for a channel."""
@@ -262,28 +240,25 @@ class TwitchViewer:
         success, message, clip_path = self.clip_manager.save_clip(channel)
         return success, message
     
-    async def _recording_update_loop(self):
-        """Periodic update loop for recording timers."""
+    async def _stream_monitor_loop(self):
+        """Monitor streams and update UI with status."""
         try:
             while self.running:
-                # Trigger render if any recordings are active
-                if self.recording_manager and self.recording_manager.recordings:
-                    if self.ui and isinstance(self.ui, MultiChannelUI):
-                        self.ui.render()
-                await asyncio.sleep(1)  # Update every second
+                # Check for dead streams
+                if self.stream_manager:
+                    dead = self.stream_manager.check_streams()
+                    if dead:
+                        for channel in dead:
+                            if self.ui:
+                                self.ui.set_status(f"⚠ Stream for #{channel} has died")
+                
+                # Update recording status in UI
+                if self.recording_manager and self.ui and isinstance(self.ui, MultiChannelUI):
+                    self.ui._update_status()
+                
+                await asyncio.sleep(1)  # Check every second
         except Exception as e:
-            logger.error(f"Error in recording update loop: {e}")
-    
-    async def _render_loop(self):
-        """Periodic UI rendering."""
-        try:
-            while self.running:
-                if self.ui and isinstance(self.ui, MultiChannelUI):
-                    # Render at reasonable rate to prevent flickering
-                    self.ui.render()
-                await asyncio.sleep(0.5)  # 2 FPS - stable and smooth
-        except Exception as e:
-            logger.error(f"Error in render loop: {e}", exc_info=True)
+            logger.error(f"Error in stream monitor loop: {e}")
     
     async def _send_message(self, channel: str, content: str):
         """Send a message to a channel."""
@@ -305,31 +280,27 @@ class TwitchViewer:
         logger.info("Stopping viewer...")
         self.running = False
         
-        # Cancel tasks
-        if self.input_task:
-            self.input_task.cancel()
+        # Cancel background tasks
+        if self.stream_check_task:
+            self.stream_check_task.cancel()
             try:
-                await self.input_task
+                await self.stream_check_task
             except asyncio.CancelledError:
                 pass
         
-        if self.render_task:
-            self.render_task.cancel()
+        if self.chat_task:
+            self.chat_task.cancel()
             try:
-                await self.render_task
+                await self.chat_task
             except asyncio.CancelledError:
                 pass
         
-        if hasattr(self, 'recording_update_task') and self.recording_update_task:
-            self.recording_update_task.cancel()
+        # Exit Textual UI if running
+        if self.ui and isinstance(self.ui, MultiChannelUI):
             try:
-                await self.recording_update_task
-            except asyncio.CancelledError:
+                self.ui.exit()
+            except:
                 pass
-        
-        # Stop UI
-        if self.ui:
-            self.ui.stop()
         
         # Disconnect chat
         if self.chat_manager:
@@ -393,6 +364,10 @@ def main():
         print("TWITCH TERMINAL VIEWER")
         print("="*60)
         change_config = input("\nChange configuration? (y/N): ").strip().lower()
+        
+        # Clear terminal after answer
+        clear_terminal()
+        
         if change_config == 'y':
             success = run_setup()
             if not success:
@@ -426,6 +401,9 @@ def main():
         print()
         channel_input = input("Channel(s): ").strip()
         
+        # Clear terminal after answer
+        clear_terminal()
+        
         if not channel_input:
             print("\nNo channels specified. Exiting.")
             sys.exit(1)
@@ -441,6 +419,10 @@ def main():
         print(f"\nWarning: {len(channels)} channels requested.")
         print("Performance may degrade with many channels.")
         response = input("Continue? (y/N): ").strip().lower()
+        
+        # Clear terminal after answer
+        clear_terminal()
+        
         if response != 'y':
             sys.exit(0)
     

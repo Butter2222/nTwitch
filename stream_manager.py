@@ -1,4 +1,3 @@
-"""Stream management for launching VLC windows with Streamlink."""
 import subprocess
 import time
 import logging
@@ -20,11 +19,23 @@ class StreamProcess:
 class StreamManager:
     """Manages multiple VLC stream processes."""
     
-    def __init__(self, vlc_path: str, quality: str = "best"):
+    # Constants
+    STREAM_LAUNCH_DELAY = 2  # Delay between launching multiple streams
+    PROCESS_START_CHECK_DELAY = 0.5  # Wait before checking if process started
+    PROCESS_TERMINATE_TIMEOUT = 3  # Seconds to wait for graceful termination
+    STREAM_TIMEOUT = 60  # Streamlink stream timeout
+    RETRY_STREAMS = 5  # Retry fetching stream info
+    RETRY_MAX = 10  # Retry connection attempts
+    RETRY_OPEN = 3  # Retry opening stream
+    
+    def __init__(self, vlc_path: str, quality: str = "best", auto_restart: bool = True):
         """Initialize stream manager."""
         self.vlc_path = vlc_path
         self.quality = quality
         self.streams: List[StreamProcess] = []
+        self.auto_restart = auto_restart  # Auto-restart dead streams
+        self._restart_count: Dict[str, int] = {}  # Track restart attempts per channel
+        self._max_restarts_per_channel = 3  # Max auto-restarts before giving up
     
     def launch_streams(self, channels: List[str]) -> Dict[str, bool]:
         """
@@ -64,11 +75,29 @@ class StreamManager:
     def _launch_single_stream(self, channel: str) -> Optional[subprocess.Popen]:
         """Launch a single VLC stream via Streamlink."""
         try:
-            # Build streamlink command (removed --twitch-proxy-playlist for compatibility)
+            # VLC arguments - only well-supported options for compatibility
+            # BUFFER SETTINGS: Change these values to add more buffering if needed
+            # --network-caching=1000 means 1 second buffer (increase for more stability, decrease for lower latency)
+            vlc_args = [
+                "--no-video-title-show",
+                f"--video-title={channel}",
+                "--network-caching=1500",      # 1.5 second buffer
+                "--no-audio-time-stretch",     # Prevent audio stretching
+                "--no-drop-late-frames",       # Don't drop late frames
+                "--no-skip-frames",            # Don't skip frames
+                "--no-sub-autodetect-file"     # Don't look for subtitles
+            ]
+            
+            # Build streamlink command with compatible stability options
             cmd = [
                 "streamlink",
                 f"--player={self.vlc_path}",
-                f"--player-args=--no-video-title-show --video-title={channel}",
+                f"--player-args={' '.join(vlc_args)}",
+                "--stream-timeout=120",              # Increased from 60 to 120 seconds
+                "--retry-streams=10",                # Increased from 5 to 10
+                "--retry-max=20",                    # Increased from 10 to 20
+                "--retry-open=5",                    # Increased from 3 to 5
+                "--ringbuffer-size=32M",             # 32MB ring buffer for stability
                 f"twitch.tv/{channel}",
                 self.quality
             ]
@@ -108,11 +137,43 @@ class StreamManager:
             if stream.process.poll() is not None:
                 dead_channels.append(stream.channel)
                 logger.warning(f"Stream for {stream.channel} has died")
+                
+                # Auto-restart if enabled
+                if self.auto_restart:
+                    restart_count = self._restart_count.get(stream.channel, 0)
+                    if restart_count < self._max_restarts_per_channel:
+                        logger.info(f"Attempting to restart stream for {stream.channel} (attempt {restart_count + 1}/{self._max_restarts_per_channel})")
+                        self._restart_stream(stream.channel)
+                    else:
+                        logger.error(f"Max restart attempts reached for {stream.channel}, giving up")
         
-        # Remove dead streams from list
-        self.streams = [s for s in self.streams if s.channel not in dead_channels]
+        # Remove dead streams from list (but not restarted ones)
+        self.streams = [s for s in self.streams if s.process.poll() is None]
         
         return dead_channels
+    
+    def _restart_stream(self, channel: str):
+        """Restart a dead stream."""
+        try:
+            # Track restart attempt
+            self._restart_count[channel] = self._restart_count.get(channel, 0) + 1
+            
+            # Launch new stream process
+            process = self._launch_single_stream(channel)
+            if process:
+                self.streams.append(StreamProcess(
+                    channel=channel,
+                    process=process,
+                    pid=process.pid
+                ))
+                logger.info(f"Successfully restarted stream for {channel}")
+                return True
+            else:
+                logger.error(f"Failed to restart stream for {channel}")
+                return False
+        except Exception as e:
+            logger.error(f"Error restarting stream for {channel}: {e}")
+            return False
     
     def cleanup(self):
         """Terminate all VLC processes."""
@@ -179,3 +240,5 @@ def parse_channel_input(input_str: str) -> List[str]:
             channels.append(channel)
     
     return channels
+        # Remove trailing slashes
+        

@@ -1,4 +1,3 @@
-"""Twitch chat client for multi-channel support."""
 import asyncio
 import logging
 import re
@@ -49,6 +48,12 @@ class ChatMessage:
 class TwitchIRCClient:
     """Twitch IRC client using raw WebSocket connection."""
     
+    # Constants
+    PING_INTERVAL = 60  # Send PING every 60 seconds
+    READ_TIMEOUT = 0.1  # Read timeout for non-blocking reads
+    MAX_RECONNECT_ATTEMPTS = 10  # Increased from 5
+    MAX_BACKOFF_SECONDS = 60  # Max wait time between reconnects
+    
     def __init__(self, channels: List[str], message_callback: Callable[[ChatMessage], None],
                  token: Optional[str] = None, username: Optional[str] = None):
         """Initialize IRC client."""
@@ -63,7 +68,8 @@ class TwitchIRCClient:
         self._task = None
         self._last_message_time = None
         self._reconnect_attempts = 0
-        self._max_reconnect_attempts = 5
+        self._max_reconnect_attempts = self.MAX_RECONNECT_ATTEMPTS
+        self._should_reconnect = True  # Allow disabling reconnect
     
     async def connect(self):
         """Connect to Twitch IRC."""
@@ -124,8 +130,9 @@ class TwitchIRCClient:
         try:
             while self._running and self._reader:
                 loop_count += 1
-                if loop_count % 100 == 0:
-                    logger.info(f"Read loop still alive (iteration {loop_count})")
+                # Only log at very high intervals or debug level
+                if loop_count % 10000 == 0:
+                    logger.debug(f"Read loop still alive (iteration {loop_count})")
                 try:
                     # Check if we need to send a keepalive PING
                     current_time = time.time()
@@ -155,8 +162,8 @@ class TwitchIRCClient:
                     if not message:
                         continue
                     
-                    # Log ALL received messages for debugging
-                    logger.debug(f"<< {message[:200]}")  # Log first 200 chars
+                    # Log received messages only at debug level
+                    logger.debug(f"<< {message[:200]}")
                     
                     # Handle PING
                     if message.startswith('PING'):
@@ -167,9 +174,15 @@ class TwitchIRCClient:
                             logger.debug("Responded to PING")
                         continue
                     
-                    # Log connection messages
-                    if ':tmi.twitch.tv' in message:
-                        logger.info(f"Server message: {message}")
+                    # Handle NOTICE messages (bans, restrictions, etc.)
+                    if 'NOTICE' in message and ':tmi.twitch.tv' in message:
+                        logger.warning(f"Server notice: {message}")
+                        self._parse_notice(message)
+                        continue
+                    
+                    # Ignore other server welcome/info messages
+                    if ':tmi.twitch.tv' in message and 'PRIVMSG' not in message:
+                        continue
                     
                     # Parse PRIVMSG
                     if 'PRIVMSG' in message:
@@ -229,6 +242,79 @@ class TwitchIRCClient:
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
             await self._attempt_reconnect()  # Try again
+    
+    def _parse_notice(self, raw_message: str):
+        """Parse IRC NOTICE messages for bans, restrictions, etc."""
+        try:
+            # Parse tags from NOTICE message
+            tags = {}
+            if raw_message.startswith('@'):
+                tag_end = raw_message.find(' :tmi.twitch.tv')
+                if tag_end > 0:
+                    tag_string = raw_message[1:tag_end]
+                    for tag in tag_string.split(';'):
+                        if '=' in tag:
+                            key, value = tag.split('=', 1)
+                            tags[key] = value
+            
+            # Extract channel from NOTICE
+            channel_match = re.search(r'NOTICE #(\w+)', raw_message)
+            if not channel_match:
+                return
+            channel = channel_match.group(1)
+            
+            # Extract the notice message text
+            notice_text_match = re.search(r'NOTICE #\w+ :(.+)$', raw_message)
+            notice_text = notice_text_match.group(1) if notice_text_match else ""
+            
+            # Get msg-id tag to determine the type of notice
+            msg_id = tags.get('msg-id', '')
+            
+            # Dictionary of restriction types and their user-friendly messages
+            restriction_messages = {
+                'msg_banned': 'CHAT RESTRICTED: You are permanently banned from this channel',
+                'msg_suspended': 'CHAT RESTRICTED: Your account is suspended',
+                'msg_channel_suspended': 'CHAT RESTRICTED: This channel is suspended',
+                'msg_timedout': 'CHAT RESTRICTED: You are timed out',
+                'msg_followersonly': 'CHAT RESTRICTED: This channel is in followers-only mode',
+                'msg_followersonly_zero': 'CHAT RESTRICTED: This channel is in followers-only mode (0 minutes)',
+                'msg_slowmode': 'CHAT RESTRICTED: This channel is in slow mode',
+                'msg_subsonly': 'CHAT RESTRICTED: This channel is in subscribers-only mode',
+                'msg_emoteonly': 'CHAT RESTRICTED: This channel is in emote-only mode',
+                'msg_verified_email': 'CHAT RESTRICTED: You must verify your email to chat',
+                'msg_ratelimit': 'CHAT RESTRICTED: You are sending messages too quickly',
+                'msg_duplicate': 'CHAT RESTRICTED: Duplicate message blocked',
+                'msg_r9k': 'CHAT RESTRICTED: This channel is in unique-chat-only mode (R9K)',
+            }
+            
+            # Create a system message if it's a restriction
+            if msg_id in restriction_messages:
+                system_msg = ChatMessage(
+                    channel=channel,
+                    author="SYSTEM",
+                    content=restriction_messages[msg_id],
+                    color="#FF0000",
+                    badges=[]
+                )
+                
+                if self.message_callback:
+                    self.message_callback(system_msg)
+                    logger.warning(f"[RESTRICTION] {channel}: {msg_id} - {restriction_messages[msg_id]}")
+            elif msg_id and 'followers' in notice_text.lower():
+                # Handle dynamic followers-only messages
+                system_msg = ChatMessage(
+                    channel=channel,
+                    author="SYSTEM",
+                    content=f"👥 CHAT RESTRICTED: {notice_text}",
+                    color="#FFA500",
+                    badges=[]
+                )
+                if self.message_callback:
+                    self.message_callback(system_msg)
+                    logger.warning(f"[RESTRICTION] {channel}: {notice_text}")
+                    
+        except Exception as e:
+            logger.error(f"Error parsing NOTICE: {e}")
     
     def _parse_message(self, raw_message: str):
         """Parse IRC PRIVMSG with tags."""
@@ -327,7 +413,13 @@ class TwitchIRCClient:
         if self._writer:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                # Try to wait for close, but don't fail if loop is closed
+                try:
+                    await self._writer.wait_closed()
+                except RuntimeError as e:
+                    if "Event loop is closed" not in str(e):
+                        raise
+                    logger.debug("Event loop already closed during cleanup")
             except Exception as e:
                 logger.error(f"Error closing writer: {e}")
 

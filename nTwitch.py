@@ -6,13 +6,13 @@ import signal
 import os
 from typing import Optional, Union
 
-from config_manager import ConfigManager
-from setup import run_setup
-from stream_manager import StreamManager, parse_channel_input
-from chat_client import ChatManager, ChatMessage
-from terminal_ui import MultiChannelUI, SimpleUI
-from recording_manager import RecordingManager
-from clip_manager import ClipManager
+from src.config_manager import ConfigManager
+from src.setup import run_setup
+from src.stream_manager import StreamManager, parse_channel_input
+from src.chat_client import ChatManager, ChatMessage
+from src.terminal_ui import MultiChannelUI, SimpleUI
+from src.recording_manager import RecordingManager
+from src.clip_manager import ClipManager
 
 
 def clear_terminal():
@@ -54,6 +54,7 @@ class TwitchViewer:
         self.running = False
         self.chat_task: Optional[asyncio.Task] = None
         self.stream_check_task: Optional[asyncio.Task] = None
+        self.switch_channels: Optional[list] = None  # Stores channels when switching
     
     async def start(self):
         """Start the viewer."""
@@ -74,13 +75,34 @@ class TwitchViewer:
         failed_channels = [(ch, msg) for ch, (success, msg) in results.items() if not success]
         
         if failed_channels:
+            print("\n" + "="*60)
+            print("CHANNEL STATUS")
+            print("="*60)
             for channel, message in failed_channels:
-                print(f"[SKIP] {message}")
+                # Determine if it's a NOT_FOUND or OFFLINE status
+                if "does not exist" in message or "check spelling" in message:
+                    print(f"❌ {channel}: Channel not found - Please verify the channel name")
+                elif "offline" in message or "not streaming" in message:
+                    print(f"💤 {channel}: Currently offline - Not streaming right now")
+                elif "restricted" in message:
+                    print(f"🚫 {channel}: Not available - May be banned or region-locked")
+                else:
+                    print(f"⚠️  {channel}: {message}")
                 logger.warning(f"{message}")
+            print("="*60 + "\n")
         
         if not successful_channels:
             logger.error("No streams are live. Exiting.")
-            print("\nNo channels are currently live. Please try again later.")
+            print("\n" + "!"*60)
+            print("NO STREAMS AVAILABLE")
+            print("!"*60)
+            print("\nNone of the requested channels are currently streaming.")
+            print("\nPossible reasons:")
+            print("  • Channel names are misspelled")
+            print("  • Channels are offline (not streaming right now)")
+            print("  • Channels don't exist")
+            print("\nPlease check the channel names and try again later.")
+            print("!"*60 + "\n")
             return
         
         logger.info(f"Successfully launched {len(successful_channels)} stream(s)")
@@ -217,9 +239,21 @@ class TwitchViewer:
             self.clip_manager.start_buffer(channel)
             logger.info(f"Auto-started clip buffer for {channel}")
     
-    async def _switch_streamers(self):
+    async def _switch_streamers(self, channel_input: str):
         """Switch to different streamers."""
-        # Exit the app which will return control to the main loop
+        # Parse the channel input
+        from src.stream_manager import parse_channel_input
+        new_channels = parse_channel_input(channel_input)
+        
+        if not new_channels:
+            if self.ui:
+                self.ui.set_status("No valid channels entered")
+            return
+        
+        # Store the channel input for the restart
+        self.switch_channels = new_channels
+        
+        # Exit the UI which will trigger the restart loop
         if self.ui and isinstance(self.ui, MultiChannelUI):
             self.ui.exit()
     
@@ -397,46 +431,37 @@ def main():
     channels = []
     if args.channels:
         channels = parse_channel_input(args.channels)
-    else:
-        # Prompt for channels
-        print("\n" + "-"*60)
-        print("CHANNEL SELECTION")
-        print("-"*60)
-        print("Enter Twitch channel(s) to watch (comma separated for multiple)")
-        print("Maximum recommended: 5 channels")
-        print("\nExamples:")
-        print("  Single:   xqc")
-        print("  Multiple: xqc, hasanabi, pokimane")
-        print()
-        channel_input = input("Channel(s): ").strip()
         
-        # Clear terminal after answer
-        clear_terminal()
+        # Warn if too many channels
+        if len(channels) > 5:
+            print(f"\nWarning: {len(channels)} channels requested.")
+            print("Performance may degrade with many channels.")
+            response = input("Continue? (y/N): ").strip().lower()
+            
+            # Clear terminal after answer
+            clear_terminal()
+            
+            if response != 'y':
+                sys.exit(0)
+        
+        print(f"\nLaunching viewer for: {', '.join(channels)}")
+        print("Please wait...\n")
+    else:
+        # No channels provided - launch UI to get channel input
+        from src.terminal_ui import ChannelSelectionApp
+        
+        print("\nLaunching channel selector...")
+        channel_input = ChannelSelectionApp.get_channels()
         
         if not channel_input:
-            print("\nNo channels specified. Exiting.")
+            print("\nNo channels selected. Exiting.")
             sys.exit(1)
         
         channels = parse_channel_input(channel_input)
-    
-    if not channels:
-        print("Error: No valid channels specified.")
-        sys.exit(1)
-    
-    # Warn if too many channels
-    if len(channels) > 5:
-        print(f"\nWarning: {len(channels)} channels requested.")
-        print("Performance may degrade with many channels.")
-        response = input("Continue? (y/N): ").strip().lower()
         
-        # Clear terminal after answer
-        clear_terminal()
-        
-        if response != 'y':
-            sys.exit(0)
-    
-    print(f"\nLaunching viewer for: {', '.join(channels)}")
-    print("Please wait...\n")
+        if not channels:
+            print("Error: No valid channels specified.")
+            sys.exit(1)
     
     # Create and run viewer
     viewer = TwitchViewer(
@@ -455,16 +480,51 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Run async main loop
+    # Run async main loop with channel switching support
+    keep_running = True
+    while keep_running:
+        try:
+            asyncio.run(viewer.start())
+            
+            # If we get here, the UI exited
+            # Check if it was a channel switch (F4) or normal exit
+            if viewer.switch_channels:
+                # F4 was pressed with new channels from modal
+                new_channels = viewer.switch_channels
+                logger.info(f"Switching to new channels: {new_channels}")
+                
+                # Small delay to ensure cleanup
+                import time
+                time.sleep(0.5)
+                
+                # Create new viewer with new channels
+                viewer = TwitchViewer(
+                    config=config,
+                    channels=new_channels,
+                    no_chat=args.no_chat,
+                    quality=args.quality,
+                    use_simple_ui=args.simple_ui
+                )
+            else:
+                # Normal exit (Ctrl+C or other)
+                keep_running = False
+                
+        except KeyboardInterrupt:
+            print("\n\nInterrupted. Exiting...")
+            keep_running = False
+        except Exception as e:
+            logger.error(f"Unexpected error in main loop: {e}")
+            print(f"\nError: {e}")
+            keep_running = False
+    
+    # Final cleanup
     try:
-        asyncio.run(viewer.start())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Final cleanup
         if viewer.running:
             asyncio.run(viewer.stop())
-        print("\nGoodbye!")
+    except:
+        pass
+    
+    print("\nGoodbye!")
 
 
 if __name__ == "__main__":

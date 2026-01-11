@@ -3,14 +3,14 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['blessed.sequences', 'blessed.formatters', 'blessed.keyboard', 'blessed.terminal', 'asyncio', 'aiofiles']
+hiddenimports = ['blessed.sequences', 'blessed.formatters', 'blessed.keyboard', 'blessed.terminal', 'asyncio', 'aiofiles', 'src.config_manager', 'src.setup', 'src.stream_manager', 'src.chat_client', 'src.terminal_ui', 'src.recording_manager', 'src.clip_manager', 'src.input_handler']
 tmp_ret = collect_all('blessed')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['twitch_viewer.py'],
-    pathex=[],
+    ['..\\nTwitch.py'],
+    pathex=['src'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='TwitchViewer',
+    name='nTwitch',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

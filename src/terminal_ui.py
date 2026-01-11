@@ -6,10 +6,11 @@ from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Static, Input, Footer, Header, RichLog
+from textual.widgets import Static, Input, Footer, Header, RichLog, Label
 from textual.reactive import reactive
 from textual.binding import Binding
 from textual import work, events
+from textual.screen import ModalScreen
 from rich.text import Text
 from rich.style import Style
 
@@ -104,23 +105,56 @@ class ChannelPane(Static):
         log.write(formatted)
     
     def _format_message(self, message: ChatMessage, my_username: Optional[str] = None) -> str:
-        """Format a chat message with Rich Text styling - returns plain string for proper wrapping."""
-        # Build message parts
+        """Format a chat message with Rich markup for colors."""
+        # Build message with Rich markup
         parts = []
         
-        # Add badge if present
+        # Add badge if present (in red for broadcaster, green for mod)
         badge = message.get_badge_text()
         if badge:
-            parts.append(badge)
+            if "[STREAMER]" in badge:
+                parts.append(f"[bold red]{badge}[/bold red]")
+            elif "[MOD]" in badge:
+                parts.append(f"[bold green]{badge}[/bold green]")
+            else:
+                parts.append(badge)
         
-        # Add username and colon
-        parts.append(f"{message.author}:")
+        # Determine username color
+        username_color = self._get_username_color(message)
         
-        # Add message content
+        # Add colored username
+        parts.append(f"[{username_color}]{message.author}:[/{username_color}]")
+        
+        # Add message content (no color - default white)
         parts.append(message.content)
         
-        # Join and return as plain string - RichLog will handle wrapping
+        # Join and return with Rich markup
         return " ".join(parts)
+    
+    def _get_username_color(self, message: ChatMessage) -> str:
+        """Get Rich markup color for username based on user type."""
+        if message.is_broadcaster():
+            return "bold red"
+        elif message.is_moderator():
+            return "bold green"
+        elif message.color:
+            # Use Twitch user color
+            try:
+                color = message.color.lstrip('#')
+                # Validate hex color
+                if len(color) == 6:
+                    return f"#{color}"
+            except:
+                pass
+        
+        # Check for subscriber or VIP
+        if message.is_subscriber():
+            return "magenta"
+        elif message.is_vip():
+            return "bold magenta"
+        
+        # Default color
+        return "white"
     
     def _get_username_style(self, message: ChatMessage) -> Style:
         """Get Rich style for username based on user type."""
@@ -181,6 +215,107 @@ class ChannelPane(Static):
             header.update(header_text)
         except:
             pass  # Widget not mounted yet
+
+
+class ChannelSwitchScreen(ModalScreen[str]):
+    """Modal screen for entering new channels."""
+    
+    CSS = """
+    ChannelSwitchScreen {
+        align: center middle;
+    }
+    
+    #switch-dialog {
+        width: 90;
+        height: auto;
+        background: $surface;
+        border: heavy #babaff;
+        padding: 2 3;
+    }
+    
+    #switch-dialog Label {
+        width: 100%;
+        content-align: center middle;
+        padding: 0;
+    }
+    
+    #switch-dialog Input {
+        width: 100%;
+        margin: 1 0;
+        border: solid #babaff;
+        background: $surface;
+        padding: 0 2;
+        height: 3;
+    }
+    
+    #switch-dialog Input:focus {
+        border: solid #f9baff;
+        background: $surface;
+    }
+    
+    #switch-dialog .title {
+        text-style: bold;
+        color: #babaff;
+        text-align: center;
+    }
+    
+    #switch-dialog .subtitle {
+        color: #babaff;
+        text-style: bold;
+        padding: 1 0;
+    }
+    
+    #switch-dialog .help-text {
+        color: $text-muted;
+        padding: 0 0;
+    }
+    
+    #switch-dialog .example {
+        color: $text-muted;
+        padding: 0 2;
+    }
+    
+    #switch-dialog .footer {
+        color: #babaff;
+        padding: 1 0 0 0;
+    }
+    """
+    
+    def compose(self) -> ComposeResult:
+        """Compose the channel switch dialog."""
+        with Container(id="switch-dialog"):
+            yield Label("┌────────────────────────────────────────────────┐", classes="title")
+            yield Label("│                                                │", classes="title")
+            yield Label("│              SWITCH CHANNELS                   │", classes="title")
+            yield Label("│                                                │", classes="title")
+            yield Label("└────────────────────────────────────────────────┘", classes="title")
+            yield Label("")
+            yield Label("Channel Selection", classes="subtitle")
+            yield Label("Enter new Twitch channel names to watch", classes="help-text")
+            yield Label("Use commas to separate multiple channels", classes="help-text")
+            yield Label("")
+            yield Input(placeholder="Enter channel names (e.g. xqc, shroud)", id="channel-input")
+            yield Label("")
+            yield Label("Examples:", classes="help-text")
+            yield Label("  xqc", classes="example")
+            yield Label("  xqc, hasanabi, pokimane", classes="example")
+            yield Label("")
+            yield Label("ENTER to continue | ESC to cancel", classes="footer")
+    
+    def on_mount(self) -> None:
+        """Focus the input when mounted."""
+        self.query_one(Input).focus()
+    
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle input submission."""
+        channels = event.value.strip()
+        if channels:
+            self.dismiss(channels)
+    
+    def on_key(self, event: events.Key) -> None:
+        """Handle key presses."""
+        if event.key == "escape":
+            self.dismiss(None)
 
 
 class StatusBar(Static):
@@ -453,10 +588,19 @@ class MultiChannelUI(App):
         success, message = await self.clip_callback(active_channel)
         self.set_status(message)
     
-    async def action_switch_streamers(self) -> None:
-        """Switch to different streamers."""
-        if self.switch_callback:
-            await self.switch_callback()
+    def action_switch_streamers(self) -> None:
+        """Switch to different streamers - show modal dialog."""
+        self._show_channel_switch_dialog()
+    
+    @work(exclusive=True)
+    async def _show_channel_switch_dialog(self) -> None:
+        """Show the channel switch dialog (must run in worker)."""
+        # Show the modal and wait for result
+        result = await self.push_screen_wait(ChannelSwitchScreen())
+        
+        if result and self.switch_callback:
+            # User entered channels, call the callback with the input
+            await self.switch_callback(result)
     
     def action_clear_chat(self) -> None:
         """Clear the active channel's chat."""
@@ -480,6 +624,199 @@ class MultiChannelUI(App):
             self.exit()
         except Exception as e:
             logger.debug(f"Error stopping UI: {e}")
+
+
+class ChannelSelectionApp(App[str]):
+    """Simple app to get channel selection at startup."""
+    
+    CSS = """
+    Screen {
+        align: center middle;
+        background: $background;
+    }
+    
+    #selection-container {
+        width: 90;
+        height: auto;
+        background: $surface;
+        border: heavy #babaff;
+        padding: 2 3;
+    }
+    
+    #selection-container Label {
+        width: 100%;
+        content-align: center middle;
+        padding: 0;
+    }
+    
+    #selection-container Input {
+        width: 100%;
+        margin: 1 0;
+        border: solid #babaff;
+        background: $surface;
+        padding: 0 2;
+        height: 3;
+    }
+    
+    #selection-container Input:focus {
+        border: solid #f9baff;
+        background: $surface;
+    }
+    
+    #selection-container .title {
+        text-style: bold;
+        color: #babaff;
+        text-align: center;
+    }
+    
+    #selection-container .subtitle {
+        color: #babaff;
+        text-style: bold;
+        padding: 1 0;
+    }
+    
+    #selection-container .help-text {
+        color: $text-muted;
+        padding: 0 0;
+    }
+    
+    #selection-container .example {
+        color: $text-muted;
+        padding: 0 2;
+    }
+    
+    #selection-container .footer {
+        color: #babaff;
+        padding: 1 0 0 0;
+    }
+    
+    #selection-container .status-live {
+        color: #00ff00;
+        padding: 0 2;
+    }
+    
+    #selection-container .status-offline {
+        color: #ffaa00;
+        padding: 0 2;
+    }
+    
+    #selection-container .status-notfound {
+        color: #ff0000;
+        padding: 0 2;
+    }
+    
+    #selection-container .status-checking {
+        color: #babaff;
+        padding: 0 2;
+    }
+    """
+    
+    def __init__(self):
+        """Initialize the app."""
+        super().__init__()
+        self.status_labels = []
+    
+    def compose(self) -> ComposeResult:
+        """Compose the channel selection dialog."""
+        with Container(id="selection-container"):
+            yield Label("┌────────────────────────────────────────────────┐", classes="title")
+            yield Label("│                                                │", classes="title")
+            yield Label("│         TWITCH TERMINAL VIEWER - nTwitch       │", classes="title")
+            yield Label("│                                                │", classes="title")
+            yield Label("└────────────────────────────────────────────────┘", classes="title")
+            yield Label("")
+            yield Label("Channel Selection", classes="subtitle")
+            yield Label("Enter Twitch channel names to watch", classes="help-text")
+            yield Label("Use commas to separate multiple channels", classes="help-text")
+            yield Label("")
+            yield Input(placeholder="Enter channel names (e.g. xqc, shroud)", id="channel-input")
+            yield Label("", id="status-message")
+            yield Label("", id="status-container")
+            yield Label("")
+            yield Label("Examples:", classes="help-text")
+            yield Label("  xqc", classes="example")
+            yield Label("  xqc, hasanabi, pokimane", classes="example")
+            yield Label("")
+            yield Label("Maximum recommended: 5 channels", classes="help-text")
+            yield Label("")
+            yield Label("ENTER to validate and continue | ESC to exit", classes="footer")
+    
+    def on_mount(self) -> None:
+        """Focus the input when mounted."""
+        self.query_one(Input).focus()
+    
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle input submission - validate channels first."""
+        channels_input = event.value.strip()
+        if not channels_input:
+            return
+        
+        # Parse channels
+        from stream_manager import parse_channel_input
+        channels = parse_channel_input(channels_input)
+        
+        if not channels:
+            status_msg = self.query_one("#status-message", Label)
+            status_msg.update("Invalid channel format")
+            return
+        
+        # Validate channels
+        await self._validate_channels(channels)
+    
+    async def _validate_channels(self, channels: List[str]) -> None:
+        """Validate that channels exist and check their status."""
+        from stream_manager import StreamManager
+        
+        # Show checking message
+        status_msg = self.query_one("#status-message", Label)
+        status_container = self.query_one("#status-container", Label)
+        status_msg.update("Checking channel status...")
+        
+        # Create a temporary StreamManager just for validation
+        manager = StreamManager(vlc_path="", quality="best")
+        
+        results = []
+        for channel in channels:
+            status, message = manager.check_stream_status(channel)
+            results.append((channel, status, message))
+        
+        # Display results
+        status_lines = []
+        live_channels = []
+        
+        for channel, status, message in results:
+            from stream_manager import StreamStatus
+            if status == StreamStatus.LIVE:
+                status_lines.append(f"[green]✓[/green] {channel}: LIVE")
+                live_channels.append(channel)
+            elif status == StreamStatus.OFFLINE:
+                status_lines.append(f"[yellow]○[/yellow] {channel}: Offline")
+            elif status == StreamStatus.NOT_FOUND:
+                status_lines.append(f"[red]✗[/red] {channel}: Not found")
+            else:
+                status_lines.append(f"[red]![/red] {channel}: Error")
+        
+        # Update status display
+        status_msg.update(f"Channel Status ({len(live_channels)}/{len(channels)} live):")
+        status_container.update("\n".join(status_lines))
+        
+        # If we have live channels, proceed after a short delay
+        if live_channels:
+            await asyncio.sleep(2)
+            self.exit(",".join(live_channels))
+        else:
+            status_msg.update("No channels are live. Press ESC to exit or try different channels.")
+    
+    def on_key(self, event: events.Key) -> None:
+        """Handle key presses."""
+        if event.key == "escape":
+            self.exit(None)
+    
+    @classmethod
+    def get_channels(cls) -> Optional[str]:
+        """Run the app and get channel selection."""
+        app = cls()
+        return app.run()
 
 
 class SimpleUI:

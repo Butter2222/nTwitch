@@ -70,21 +70,48 @@ class StreamManager:
                     if data.get("streams"):
                         return StreamStatus.LIVE, f"Channel '{channel}' is live"
                     else:
-                        return StreamStatus.OFFLINE, f"Channel '{channel}' is currently offline"
+                        return StreamStatus.OFFLINE, f"Channel '{channel}' is currently offline (not streaming)"
                 except json.JSONDecodeError:
                     return StreamStatus.ERROR, f"Could not parse stream data for '{channel}'"
             else:
-                # Check error message
+                # Check error message for better error detection
                 stderr = result.stderr.lower()
-                if "no plugin" in stderr or "unable to find" in stderr or "not found" in stderr:
-                    return StreamStatus.NOT_FOUND, f"Channel '{channel}' does not exist"
-                else:
-                    return StreamStatus.OFFLINE, f"Channel '{channel}' is currently offline"
+                stdout = result.stdout.lower()
+                combined_output = stderr + stdout
+                
+                # Check for various "not found" indicators
+                not_found_indicators = [
+                    "no plugin",
+                    "unable to find",
+                    "not found",
+                    "no streams found",
+                    "404",
+                    "channel not found",
+                    "user not found",
+                    "does not exist"
+                ]
+                
+                if any(indicator in combined_output for indicator in not_found_indicators):
+                    return StreamStatus.NOT_FOUND, f"Channel '{channel}' does not exist (check spelling)"
+                
+                # Check for offline indicators
+                offline_indicators = [
+                    "offline",
+                    "not streaming",
+                    "no stream",
+                    "not broadcasting"
+                ]
+                
+                if any(indicator in combined_output for indicator in offline_indicators):
+                    return StreamStatus.OFFLINE, f"Channel '{channel}' exists but is not currently streaming"
+                
+                # Default to offline if we can't determine the exact reason
+                return StreamStatus.OFFLINE, f"Channel '{channel}' is not available (may be offline or restricted)"
                     
         except subprocess.TimeoutExpired:
-            return StreamStatus.ERROR, f"Timeout checking status for '{channel}'"
+            return StreamStatus.ERROR, f"Timeout checking status for '{channel}' (connection issue)"
         except FileNotFoundError:
-            return StreamStatus.ERROR, "Streamlink not found"
+            return StreamStatus.ERROR, "Streamlink not found - please ensure it is installed"
         except Exception as e:
             return StreamStatus.ERROR, f"Error checking '{channel}': {str(e)}"
     
@@ -319,4 +346,3 @@ def parse_channel_input(input_str: str) -> List[str]:
             channels.append(channel)
     
     return channels
-        # Remove trailing slashes
